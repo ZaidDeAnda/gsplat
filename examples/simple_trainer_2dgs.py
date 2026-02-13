@@ -171,6 +171,16 @@ class Config:
     # Save training images to tensorboard
     tb_save_image: bool = False
 
+    #Añado el plano para que compartan propiedades
+    plane_enable: bool = True
+    plane_n = Tuple[float, float, float] = (0.0, 1.0, 0.0)
+    plane_d: float = 0.0
+    plane_eps: float = 0.01
+
+    plane_share_quat: bool = True
+
+    plane_shared_lr: float = 1e-3
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -210,13 +220,14 @@ def create_splats_with_optimizers(
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
-    quats = torch.rand((N, 4))  # [N, 4]
+    quats = torch.rand((N, 4))
     opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
 
     params = [
         # name, value, lr
         ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
         ("scales", torch.nn.Parameter(scales), 5e-3),
+        #Eliminamos quats por quats_free y plane_quat
         ("quats", torch.nn.Parameter(quats), 1e-3),
         ("opacities", torch.nn.Parameter(opacities), 5e-2),
     ]
@@ -386,6 +397,24 @@ class Runner:
                 mode="training",
             )
 
+        # Para compartir plano
+
+        self.plane_params = []
+        self.plane_optimizer = None
+
+        if self.cfg.plane_enable:
+            if self.cfg.plane_share_quat:
+                self.plane_quat = torch.nn.Parameter(torch.randn(4, device=self.device))
+                self.plane_params.append(self.plane_quat)     
+
+        if len(self.plane_params) > 0:
+            self.plane_optimizer = torch.optim.Adam(
+                self.plane_params,
+                lr = self.cfg.plane_shared_lr * math.sqrt(self.cfg.batch_size),
+                eps = 1e-15 / math.sqrt(self.cfg.batch_size),
+                betas = (1 - self.cfg.batch_size * (1 - 0.9), 1- self.cfg.batch_size * (1-0.999))
+            ) 
+
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
@@ -397,9 +426,25 @@ class Runner:
         means = self.splats["means"]  # [N, 3]
         # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
-        quats = self.splats["quats"]  # [N, 4]
+
+        if self.cfg.plane_enable:
+            n = torch.tensor(self.cfg.plane_n, device=means.device, dtype=means.dtype)
+            n = n / (n.norm() + 1e-12)
+            dist = means @ n + self.cfg.plane_d
+            mask = dist.abs() < self.cfg.plane_eps
+        else:
+            mask = None
+
+        quats_free = self.splats["quats"]
+        if self.cfg.plane_enable and self.cfg.plane_share_quat and mask is not None and mask.any():
+            q_shared = self.plane_quat[None, :].expand_as(quats_free)
+            quats = torch.where(mask[:, None], q_shared, quats_free)
+        else:
+            quats = quats_free
+
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
@@ -709,6 +754,9 @@ class Runner:
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
+            if self.plane_optimizer is not None:
+                self.plane_optimizer.step()
+                self.plane_optimizer.zero_grad(set_to_none=True)
 
             # save checkpoint
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
