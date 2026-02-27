@@ -173,8 +173,8 @@ class Config:
 
     #Añado el plano para que compartan propiedades
     plane_enable: bool = True
-    plane_n = Tuple[float, float, float] = (0.0, 1.0, 0.0)
-    plane_d: float = 0.0
+    plane_n = Tuple[float, float, float] = (0.00782567, 0.87997583, 0.47495399)
+    plane_d: float = -3.10583352
     plane_eps: float = 0.01
 
     plane_share_quat: bool = True
