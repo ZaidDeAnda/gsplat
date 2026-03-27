@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple
 from pathlib import Path
+import psutil
 
 import imageio
 import nerfview
@@ -259,6 +260,16 @@ def create_splats_with_optimizers(
         for name, _, lr in params
     }
     return splats, optimizers
+
+def get_ram_usage_mb():
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / (1024 ** 2)
+
+
+def get_gpu_mem_mb():
+    if torch.cuda.is_available():
+        return torch.cuda.memory_allocated() / (1024 ** 2)
+    return 0.0
 
 
 class Runner:
@@ -683,7 +694,15 @@ class Runner:
 
             loss.backward()
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            ram_mb = get_ram_usage_mb()
+            gpu_mb = get_gpu_mem_mb()
+
+            desc = (
+                f"loss={loss.item():.3f}| "
+                f"sh={sh_degree_to_use}| "
+                f"RAM={ram_mb:.1f}MB| "
+                f"GPU={gpu_mb:.1f}MB| "
+            )
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.dist_loss:
@@ -696,11 +715,15 @@ class Runner:
 
             if cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
+                ram_mb = get_ram_usage_mb()
+                gpu_mb = get_gpu_mem_mb()
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
+                self.writer.add_scalar("system/ram_mb", ram_mb, step)
+                self.writer.add_scalar("system/gpu_mb", gpu_mb, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.normal_loss:
@@ -762,7 +785,9 @@ class Runner:
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 stats = {
-                    "mem": mem,
+                    "gpu_mem_gb": mem,
+                    "ram_mb": get_ram_usage_mb(),
+                    "gpu_mb": get_gpu_mem_mb(),
                     "ellipse_time": time.time() - global_tic,
                     "num_GS": len(self.splats["means"]),
                 }
