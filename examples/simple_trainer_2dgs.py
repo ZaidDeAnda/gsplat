@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple
 from pathlib import Path
 import psutil
+import shutil
 
 import imageio
 import nerfview
@@ -794,6 +795,7 @@ class Runner:
                 print("Step: ", step, stats)
                 with open(f"{self.stats_dir}/train_step{step:04d}.json", "w") as f:
                     json.dump(stats, f)
+                shutil.copy(f"{self.stats_dir}/train_step{step:04d}.json", '/content/drive/MyDrive/TESIS - CIMAT/resultados/optimizado')
                 torch.save(
                     {
                         "step": step,
