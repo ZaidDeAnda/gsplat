@@ -220,6 +220,10 @@ def create_splats_with_optimizers(
             n = torch.tensor(plane_n, dtype=points.dtype)
             n = n / (n.norm() + 1e-12)
 
+            d = torch.tensor(cfg.plane_d, dtype=points.dtype)
+
+            d = d / (n.norm() + 1e-12)
+
             dist = points @ n + plane_d
             plane_mask = dist.abs() < plane_eps
             keep_mask = ~plane_mask
