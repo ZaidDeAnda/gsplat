@@ -207,10 +207,30 @@ def create_splats_with_optimizers(
     batch_size: int = 1,
     feature_dim: Optional[int] = None,
     device: str = "cuda",
+    plane_enable: bool = False,
+    plane_n: Tuple[float, float, float] = (0.0, 1.0, 0.0),
+    plane_d: float = 0.0,
+    plane_eps: float = 0.01,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+
+        if plane_enable:
+            n = torch.tensor(plane_n, dtype=points.dtype)
+            n = n / (n.norm() + 1e-12)
+
+            dist = points @ n + plane_d
+            plane_mask = dist.abs() < plane_eps
+            keep_mask = ~plane_mask
+
+            print(
+                f"Plane filtering: removing {plane_mask.sum().item()} / {points.shape[0]} "
+                f"points ({plane_mask.float().mean().item() * 100:.2f}%)"
+            )
+
+            points = points[keep_mask]
+            rgbs = rgbs[keep_mask]
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
@@ -328,6 +348,10 @@ class Runner:
             batch_size=cfg.batch_size,
             feature_dim=feature_dim,
             device=self.device,
+            plane_enable=cfg.plane_enable,
+            plane_n=cfg.plane_n,
+            plane_d=cfg.plane_d,
+            plane_eps=cfg.plane_eps,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
         self.model_type = cfg.model_type
@@ -409,24 +433,6 @@ class Runner:
                 mode="training",
             )
 
-        # Para compartir plano
-
-        self.plane_params = []
-        self.plane_optimizer = None
-
-        if self.cfg.plane_enable:
-            if self.cfg.plane_share_quat:
-                self.plane_quat = torch.nn.Parameter(torch.randn(4, device=self.device))
-                self.plane_params.append(self.plane_quat)     
-
-        if len(self.plane_params) > 0:
-            self.plane_optimizer = torch.optim.Adam(
-                self.plane_params,
-                lr = self.cfg.plane_shared_lr * math.sqrt(self.cfg.batch_size),
-                eps = 1e-15 / math.sqrt(self.cfg.batch_size),
-                betas = (1 - self.cfg.batch_size * (1 - 0.9), 1- self.cfg.batch_size * (1-0.999))
-            ) 
-
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
@@ -435,25 +441,11 @@ class Runner:
         height: int,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
+        
         means = self.splats["means"]  # [N, 3]
         # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
-
-        if self.cfg.plane_enable:
-            n = torch.tensor(self.cfg.plane_n, device=means.device, dtype=means.dtype)
-            n = n / (n.norm() + 1e-12)
-            dist = means @ n + self.cfg.plane_d
-            mask = dist.abs() < self.cfg.plane_eps
-        else:
-            mask = None
-
-        quats_free = self.splats["quats"]
-        if self.cfg.plane_enable and self.cfg.plane_share_quat and mask is not None and mask.any():
-            q_shared = self.plane_quat[None, :].expand_as(quats_free)
-            quats = torch.where(mask[:, None], q_shared, quats_free)
-        else:
-            quats = quats_free
-
+        quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
