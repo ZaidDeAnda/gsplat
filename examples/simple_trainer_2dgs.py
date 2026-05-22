@@ -304,6 +304,88 @@ def get_gpu_mem_mb():
         return torch.cuda.memory_allocated() / (1024 ** 2)
     return 0.0
 
+def fit_plane_ransac(
+    points_np: np.ndarray,
+    num_iters: int = 2000,
+    threshold: float = 0.05,
+    min_inlier_ratio: float = 0.05,
+    seed: int = 42,
+) -> Tuple[Tuple[float, float, float], float, np.ndarray]:
+    """
+    Ajusta un plano con RANSAC sobre puntos ya transformados por el Parser.
+
+    Retorna:
+        plane_n: normal unitaria (nx, ny, nz)
+        plane_d: offset del plano n @ x + d = 0
+        best_inliers: máscara booleana de inliers
+    """
+    rng = np.random.default_rng(seed)
+    points = np.asarray(points_np, dtype=np.float32)
+
+    n_points = points.shape[0]
+    if n_points < 3:
+        raise ValueError("Se necesitan al menos 3 puntos para ajustar un plano.")
+
+    best_inliers = None
+    best_count = 0
+    best_n = None
+    best_d = None
+
+    for _ in range(num_iters):
+        ids = rng.choice(n_points, size=3, replace=False)
+        p1, p2, p3 = points[ids]
+
+        normal = np.cross(p2 - p1, p3 - p1)
+        norm = np.linalg.norm(normal)
+
+        if norm < 1e-8:
+            continue
+
+        normal = normal / norm
+        d = -np.dot(normal, p1)
+
+        distances = np.abs(points @ normal + d)
+        inliers = distances < threshold
+        count = int(inliers.sum())
+
+        if count > best_count:
+            best_count = count
+            best_inliers = inliers
+            best_n = normal
+            best_d = d
+
+    if best_inliers is None:
+        raise RuntimeError("RANSAC no encontró un plano válido.")
+
+    inlier_ratio = best_count / n_points
+    if inlier_ratio < min_inlier_ratio:
+        print(
+            f"Warning: mejor plano tiene pocos inliers: "
+            f"{best_count}/{n_points} ({inlier_ratio * 100:.2f}%)"
+        )
+
+    # Refit final usando todos los inliers del mejor plano
+    inlier_points = points[best_inliers]
+    centroid = inlier_points.mean(axis=0)
+    centered = inlier_points - centroid
+
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    refined_n = vh[-1]
+    refined_n = refined_n / (np.linalg.norm(refined_n) + 1e-12)
+    refined_d = -np.dot(refined_n, centroid)
+
+    refined_distances = np.abs(points @ refined_n + refined_d)
+    refined_inliers = refined_distances < threshold
+
+    print(
+        f"RANSAC plane: inliers={refined_inliers.sum()} / {n_points} "
+        f"({refined_inliers.mean() * 100:.2f}%)"
+    )
+    print("plane_n:", tuple(refined_n.tolist()))
+    print("plane_d:", float(refined_d))
+
+    return tuple(refined_n.tolist()), float(refined_d), refined_inliers
+
 
 class Runner:
     """Engine for training and testing."""
@@ -335,6 +417,17 @@ class Runner:
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
         )
+
+        if cfg.plane_enable:
+            plane_n, plane_d, _ = fit_plane_ransac(
+                self.parser.points,
+                num_iters=2000,
+                threshold=cfg.plane_eps,
+                seed=42,
+            )
+
+            cfg.plane_n = plane_n
+            cfg.plane_d = plane_d
         self.trainset = Dataset(
             self.parser,
             split="train",
