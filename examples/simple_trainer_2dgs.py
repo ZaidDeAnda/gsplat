@@ -34,6 +34,7 @@ from utils import (
 from gsplat_viewer_2dgs import GsplatViewer, GsplatRenderTabState
 from gsplat.rendering import rasterization_2dgs, rasterization_2dgs_inria_wrapper
 from gsplat.strategy import DefaultStrategy
+from gsplat.strategy.ops import remove
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 
@@ -538,6 +539,33 @@ class Runner:
                 mode="training",
             )
 
+    @torch.no_grad()
+    def prune_plane_gaussians(self, step: int):
+        cfg = self.cfg
+        means = self.splats["means"]
+
+        n = torch.tensor(cfg.plane_n, device=means.device, dtype=means.dtype)
+        d = torch.tensor(cfg.plane_d, device=means.device, dtype=means.dtype)
+
+        norm = n.norm() + 1e-12
+        n = n / norm
+        d = d / norm
+
+        dist = means @ n + d
+
+        # True = gaussianas a eliminar
+        prune_mask = dist.abs() < cfg.plane_eps
+
+        n_prune = prune_mask.sum().item()
+        if n_prune > 0:
+            remove(
+                params=self.splats,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                mask=prune_mask,
+            )
+            print(f"Step {step}: pruned {n_prune} plane GS")
+
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
@@ -847,6 +875,16 @@ class Runner:
                 info=info,
                 packed=cfg.packed,
             )
+
+            #remove gaussians near the plane
+
+            if (
+                cfg.plane_enable
+                and step >= cfg.refine_start_iter
+                and step <= cfg.refine_stop_iter
+                and step % cfg.refine_every == 0
+            ):
+                self.prune_plane_gaussians(step)
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
