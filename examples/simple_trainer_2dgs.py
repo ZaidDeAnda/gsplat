@@ -770,9 +770,6 @@ class Runner:
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
-            if self.plane_optimizer is not None:
-                self.plane_optimizer.step()
-                self.plane_optimizer.zero_grad(set_to_none=True)
 
             # save checkpoint
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
