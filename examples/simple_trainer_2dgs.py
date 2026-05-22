@@ -225,6 +225,14 @@ def create_splats_with_optimizers(
             d = d / (n.norm() + 1e-12)
 
             dist = points @ n + plane_d
+
+            abs_dist = dist.abs()
+            print("plane_eps:", cfg.plane_eps)
+            print("removed:", (abs_dist < cfg.plane_eps).sum().item(), "/", points.shape[0])
+            print("p01:", torch.quantile(abs_dist, 0.01).item())
+            print("p05:", torch.quantile(abs_dist, 0.05).item())
+            print("p10:", torch.quantile(abs_dist, 0.10).item())
+            print("median:", abs_dist.median().item())
             plane_mask = dist.abs() < plane_eps
             keep_mask = ~plane_mask
 
