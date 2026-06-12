@@ -878,13 +878,18 @@ class Runner:
 
             #remove gaussians near the plane
 
-            if (
-                cfg.plane_enable
-                and step >= cfg.refine_start_iter
-                and step <= cfg.refine_stop_iter
-                and step % cfg.refine_every == 0
-            ):
-                self.prune_plane_gaussians(step)
+            # POC: congelar color/SH de las gaussianas del plano
+            if cfg.plane_enable:
+                with torch.no_grad():
+                    means = self.splats["means"]
+                    n = torch.tensor(cfg.plane_n, device=means.device, dtype=means.dtype)
+                    d = torch.tensor(cfg.plane_d, device=means.device, dtype=means.dtype)
+                    norm = n.norm() + 1e-12
+                    plane_mask = (means @ (n / norm) + d / norm).abs() < cfg.plane_eps
+
+                for k in ["sh0", "shN"]:
+                    if self.splats[k].grad is not None:
+                        self.splats[k].grad[plane_mask] = 0
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
