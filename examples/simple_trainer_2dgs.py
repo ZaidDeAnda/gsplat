@@ -3,7 +3,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from pathlib import Path
 import psutil
 import shutil
@@ -34,7 +34,6 @@ from utils import (
 from gsplat_viewer_2dgs import GsplatViewer, GsplatRenderTabState
 from gsplat.rendering import rasterization_2dgs, rasterization_2dgs_inria_wrapper
 from gsplat.strategy import DefaultStrategy
-from gsplat.strategy.ops import remove
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 
@@ -195,6 +194,78 @@ class Config:
         self.refine_every = int(self.refine_every * factor)
 
 
+class FrozenSplats(torch.nn.Module):
+    """Non-trainable Gaussian attributes that still participate in rendering."""
+
+    def __init__(self, values: Dict[str, Tensor]) -> None:
+        super().__init__()
+        for name, value in values.items():
+            self.register_buffer(name, value.detach().contiguous())
+
+
+class FreeOnlyDefaultStrategy(DefaultStrategy):
+    """DefaultStrategy whose statistics ignore the frozen tail of a render."""
+
+    def _update_state(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        state: Dict[str, Any],
+        info: Dict[str, Any],
+        packed: bool = False,
+    ) -> None:
+        for key in [
+            "width",
+            "height",
+            "n_cameras",
+            "radii",
+            "gaussian_ids",
+            self.key_for_gradient,
+        ]:
+            assert key in info, f"{key} is required but missing."
+
+        gradient_source = info[self.key_for_gradient]
+        if self.absgrad:
+            grads = gradient_source.absgrad.clone()
+        else:
+            assert gradient_source.grad is not None
+            grads = gradient_source.grad.clone()
+
+        grads[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
+        grads[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
+
+        n_free = len(params["means"])
+        if state["grad2d"] is None:
+            state["grad2d"] = torch.zeros(n_free, device=grads.device)
+        if state["count"] is None:
+            state["count"] = torch.zeros(n_free, device=grads.device)
+        if self.refine_scale2d_stop_iter > 0 and state["radii"] is None:
+            state["radii"] = torch.zeros(n_free, device=grads.device)
+
+        if packed:
+            gaussian_ids = info["gaussian_ids"]
+            free_entries = gaussian_ids < n_free
+            gs_ids = gaussian_ids[free_entries]
+            grads = grads[free_entries]
+            radii = info["radii"][free_entries].max(dim=-1).values
+        else:
+            grads = grads[:, :n_free]
+            free_radii = info["radii"][:, :n_free]
+            visible = (free_radii > 0.0).all(dim=-1)
+            gs_ids = torch.where(visible)[1]
+            grads = grads[visible]
+            radii = free_radii[visible].max(dim=-1).values
+
+        state["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
+        state["count"].index_add_(
+            0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32)
+        )
+        if self.refine_scale2d_stop_iter > 0:
+            state["radii"][gs_ids] = torch.maximum(
+                state["radii"][gs_ids],
+                radii / float(max(info["width"], info["height"])),
+            )
+
+
 def create_splats_with_optimizers(
     parser: Parser,
     init_type: str = "sfm",
@@ -212,38 +283,15 @@ def create_splats_with_optimizers(
     plane_n: Tuple[float, float, float] = (0.0, 1.0, 0.0),
     plane_d: float = 0.0,
     plane_eps: float = 0.01,
-) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
+) -> Tuple[
+    torch.nn.ParameterDict,
+    FrozenSplats,
+    Dict[str, torch.optim.Optimizer],
+]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
 
-        if plane_enable:
-            n = torch.tensor(plane_n, dtype=points.dtype)
-            n = n / (n.norm() + 1e-12)
-
-            d = torch.tensor(cfg.plane_d, dtype=points.dtype)
-
-            d = d / (n.norm() + 1e-12)
-
-            dist = points @ n + plane_d
-
-            abs_dist = dist.abs()
-            print("plane_eps:", cfg.plane_eps)
-            print("removed:", (abs_dist < cfg.plane_eps).sum().item(), "/", points.shape[0])
-            print("p01:", torch.quantile(abs_dist, 0.01).item())
-            print("p05:", torch.quantile(abs_dist, 0.05).item())
-            print("p10:", torch.quantile(abs_dist, 0.10).item())
-            print("median:", abs_dist.median().item())
-            plane_mask = dist.abs() < plane_eps
-            keep_mask = ~plane_mask
-
-            print(
-                f"Plane filtering: removing {plane_mask.sum().item()} / {points.shape[0]} "
-                f"points ({plane_mask.float().mean().item() * 100:.2f}%)"
-            )
-
-            points = points[keep_mask]
-            rgbs = rgbs[keep_mask]
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
@@ -280,7 +328,35 @@ def create_splats_with_optimizers(
         colors = torch.logit(rgbs)  # [N, 3]
         params.append(("colors", torch.nn.Parameter(colors), 2.5e-3))
 
-    splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
+    if plane_enable:
+        normal = torch.tensor(plane_n, dtype=points.dtype)
+        normal_norm = normal.norm().clamp_min(1e-12)
+        normal = normal / normal_norm
+        offset = torch.as_tensor(plane_d, dtype=points.dtype) / normal_norm
+        plane_mask = (points @ normal + offset).abs() < plane_eps
+    else:
+        plane_mask = torch.zeros(N, dtype=torch.bool)
+
+    free_mask = ~plane_mask
+    if not free_mask.any():
+        raise ValueError(
+            "RANSAC classified every initial Gaussian as part of the plane; "
+            "increase selectivity by reducing plane_eps."
+        )
+
+    all_values = {name: value for name, value, _ in params}
+    splats = torch.nn.ParameterDict(
+        {
+            name: torch.nn.Parameter(value[free_mask].contiguous())
+            for name, value in all_values.items()
+        }
+    ).to(device)
+    plane_splats = FrozenSplats(
+        {
+            name: value[plane_mask].contiguous()
+            for name, value in all_values.items()
+        }
+    ).to(device)
     # Scale learning rate based on batch size, reference:
     # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
     # Note that this would not make the training exactly equivalent, see
@@ -293,7 +369,11 @@ def create_splats_with_optimizers(
         )
         for name, _, lr in params
     }
-    return splats, optimizers
+    print(
+        f"Gaussian split: {free_mask.sum().item()} trainable, "
+        f"{plane_mask.sum().item()} frozen on the dominant plane."
+    )
+    return splats, plane_splats, optimizers
 
 def get_ram_usage_mb():
     process = psutil.Process(os.getpid())
@@ -439,27 +519,39 @@ class Runner:
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
+        if cfg.plane_enable and cfg.sparse_grad:
+            raise ValueError(
+                "plane_enable does not support sparse_grad yet; use --no-sparse-grad."
+            )
+
         # Model
         feature_dim = 32 if cfg.app_opt else None
-        self.splats, self.optimizers = create_splats_with_optimizers(
-            self.parser,
-            init_type=cfg.init_type,
-            init_num_pts=cfg.init_num_pts,
-            init_extent=cfg.init_extent,
-            init_opacity=cfg.init_opa,
-            init_scale=cfg.init_scale,
-            scene_scale=self.scene_scale,
-            sh_degree=cfg.sh_degree,
-            sparse_grad=cfg.sparse_grad,
-            batch_size=cfg.batch_size,
-            feature_dim=feature_dim,
-            device=self.device,
-            plane_enable=cfg.plane_enable,
-            plane_n=cfg.plane_n,
-            plane_d=cfg.plane_d,
-            plane_eps=cfg.plane_eps,
+        self.splats, self.plane_splats, self.optimizers = (
+            create_splats_with_optimizers(
+                self.parser,
+                init_type=cfg.init_type,
+                init_num_pts=cfg.init_num_pts,
+                init_extent=cfg.init_extent,
+                init_opacity=cfg.init_opa,
+                init_scale=cfg.init_scale,
+                scene_scale=self.scene_scale,
+                sh_degree=cfg.sh_degree,
+                sparse_grad=cfg.sparse_grad,
+                batch_size=cfg.batch_size,
+                feature_dim=feature_dim,
+                device=self.device,
+                plane_enable=cfg.plane_enable,
+                plane_n=cfg.plane_n,
+                plane_d=cfg.plane_d,
+                plane_eps=cfg.plane_eps,
+            )
         )
-        print("Model initialized. Number of GS:", len(self.splats["means"]))
+        print(
+            "Model initialized. Number of GS:",
+            self.num_gaussians,
+            f"({self.num_trainable_gaussians} trainable, "
+            f"{self.num_plane_gaussians} frozen)",
+        )
         self.model_type = cfg.model_type
 
         if self.model_type == "2dgs":
@@ -468,7 +560,7 @@ class Runner:
             key_for_gradient = "means2d"
 
         # Densification Strategy
-        self.strategy = DefaultStrategy(
+        self.strategy = FreeOnlyDefaultStrategy(
             verbose=True,
             prune_opa=cfg.prune_opa,
             grow_grad2d=cfg.grow_grad2d,
@@ -484,7 +576,9 @@ class Runner:
             key_for_gradient=key_for_gradient,
         )
         self.strategy.check_sanity(self.splats, self.optimizers)
-        self.strategy_state = self.strategy.initialize_state()
+        self.strategy_state = self.strategy.initialize_state(
+            scene_scale=self.scene_scale
+        )
 
         self.pose_optimizers = []
         if cfg.pose_opt:
@@ -539,32 +633,23 @@ class Runner:
                 mode="training",
             )
 
-    @torch.no_grad()
-    def prune_plane_gaussians(self, step: int):
-        cfg = self.cfg
-        means = self.splats["means"]
+    @property
+    def num_trainable_gaussians(self) -> int:
+        return len(self.splats["means"])
 
-        n = torch.tensor(cfg.plane_n, device=means.device, dtype=means.dtype)
-        d = torch.tensor(cfg.plane_d, device=means.device, dtype=means.dtype)
+    @property
+    def num_plane_gaussians(self) -> int:
+        return len(self.plane_splats.means)
 
-        norm = n.norm() + 1e-12
-        n = n / norm
-        d = d / norm
+    @property
+    def num_gaussians(self) -> int:
+        return self.num_trainable_gaussians + self.num_plane_gaussians
 
-        dist = means @ n + d
-
-        # True = gaussianas a eliminar
-        prune_mask = dist.abs() < cfg.plane_eps
-
-        n_prune = prune_mask.sum().item()
-        if n_prune > 0:
-            remove(
-                params=self.splats,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                mask=prune_mask,
-            )
-            print(f"Step {step}: pruned {n_prune} plane GS")
+    def combined_splat(self, name: str) -> Tensor:
+        """Return trainable Gaussians followed by the frozen plane Gaussians."""
+        if self.num_plane_gaussians == 0:
+            return self.splats[name]
+        return torch.cat([self.splats[name], getattr(self.plane_splats, name)], dim=0)
 
     def rasterize_splats(
         self,
@@ -575,26 +660,28 @@ class Runner:
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
         
-        means = self.splats["means"]  # [N, 3]
-        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
+        means = self.combined_splat("means")  # [N, 3]
+        # quats = F.normalize(self.combined_splat("quats"), dim=-1)  # [N, 4]
         # rasterization does normalization internally
-        quats = self.splats["quats"]  # [N, 4]
-        scales = torch.exp(self.splats["scales"])  # [N, 3]
-        opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+        quats = self.combined_splat("quats")  # [N, 4]
+        scales = torch.exp(self.combined_splat("scales"))  # [N, 3]
+        opacities = torch.sigmoid(self.combined_splat("opacities"))  # [N,]
 
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
             colors = self.app_module(
-                features=self.splats["features"],
+                features=self.combined_splat("features"),
                 embed_ids=image_ids,
                 dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
                 sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
             )
-            colors = colors + self.splats["colors"]
+            colors = colors + self.combined_splat("colors")
             colors = torch.sigmoid(colors)
         else:
-            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+            colors = torch.cat(
+                [self.combined_splat("sh0"), self.combined_splat("shN")], 1
+            )  # [N, K, 3]
 
         assert self.cfg.antialiased is False, "Antialiased is not supported for 2DGS"
 
@@ -846,7 +933,13 @@ class Runner:
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
-                self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
+                self.writer.add_scalar("train/num_GS", self.num_gaussians, step)
+                self.writer.add_scalar(
+                    "train/num_GS_trainable", self.num_trainable_gaussians, step
+                )
+                self.writer.add_scalar(
+                    "train/num_GS_plane", self.num_plane_gaussians, step
+                )
                 self.writer.add_scalar("train/mem", mem, step)
                 self.writer.add_scalar("system/ram_mb", ram_mb, step)
                 self.writer.add_scalar("system/gpu_mb", gpu_mb, step)
@@ -875,21 +968,6 @@ class Runner:
                 info=info,
                 packed=cfg.packed,
             )
-
-            #remove gaussians near the plane
-
-            # POC: congelar color/SH de las gaussianas del plano
-            if cfg.plane_enable:
-                with torch.no_grad():
-                    means = self.splats["means"]
-                    n = torch.tensor(cfg.plane_n, device=means.device, dtype=means.dtype)
-                    d = torch.tensor(cfg.plane_d, device=means.device, dtype=means.dtype)
-                    norm = n.norm() + 1e-12
-                    plane_mask = (means @ (n / norm) + d / norm).abs() < cfg.plane_eps
-
-                for k in ["sh0", "shN"]:
-                    if self.splats[k].grad is not None:
-                        self.splats[k].grad[plane_mask] = 0
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
@@ -927,7 +1005,9 @@ class Runner:
                     "ram_mb": get_ram_usage_mb(),
                     "gpu_mb": get_gpu_mem_mb(),
                     "ellipse_time": time.time() - global_tic,
-                    "num_GS": len(self.splats["means"]),
+                    "num_GS": self.num_gaussians,
+                    "num_GS_trainable": self.num_trainable_gaussians,
+                    "num_GS_plane": self.num_plane_gaussians,
                 }
                 print("Step: ", step, stats)
                 with open(f"{self.stats_dir}/train_step{step:04d}.json", "w") as f:
@@ -937,6 +1017,12 @@ class Runner:
                     {
                         "step": step,
                         "splats": self.splats.state_dict(),
+                        "plane_splats": self.plane_splats.state_dict(),
+                        "plane": {
+                            "normal": cfg.plane_n,
+                            "offset": cfg.plane_d,
+                            "threshold": cfg.plane_eps,
+                        },
                     },
                     f"{self.ckpt_dir}/ckpt_{step}.pt",
                 )
@@ -1071,7 +1157,9 @@ class Runner:
         print(
             f"PSNR: {psnr.item():.3f}, SSIM: {ssim.item():.4f}, LPIPS: {lpips.item():.3f} "
             f"Time: {ellipse_time:.3f}s/image "
-            f"Number of GS: {len(self.splats['means'])}"
+            f"Number of GS: {self.num_gaussians} "
+            f"({self.num_trainable_gaussians} trainable, "
+            f"{self.num_plane_gaussians} frozen)"
         )
         # save stats as json
         stats = {
@@ -1079,7 +1167,9 @@ class Runner:
             "ssim": ssim.item(),
             "lpips": lpips.item(),
             "ellipse_time": ellipse_time,
-            "num_GS": len(self.splats["means"]),
+            "num_GS": self.num_gaussians,
+            "num_GS_trainable": self.num_trainable_gaussians,
+            "num_GS_plane": self.num_plane_gaussians,
         }
         with open(f"{self.stats_dir}/val_step{step:04d}.json", "w") as f:
             json.dump(stats, f)
@@ -1183,7 +1273,7 @@ class Runner:
             backgrounds=torch.tensor([render_tab_state.backgrounds], device=self.device)
             / 255.0,
         )  # [1, H, W, 3]
-        render_tab_state.total_gs_count = len(self.splats["means"])
+        render_tab_state.total_gs_count = self.num_gaussians
         render_tab_state.rendered_gs_count = (info["radii"] > 0).all(-1).sum().item()
 
         if render_tab_state.render_mode == "depth":
@@ -1226,6 +1316,13 @@ def main(cfg: Config):
         ckpt = torch.load(cfg.ckpt, map_location=runner.device)
         for k in runner.splats.keys():
             runner.splats[k].data = ckpt["splats"][k]
+        if cfg.plane_enable and "plane_splats" not in ckpt:
+            raise ValueError(
+                "This checkpoint predates separated plane Gaussians and cannot be "
+                "loaded with plane_enable=True."
+            )
+        if "plane_splats" in ckpt:
+            runner.plane_splats.load_state_dict(ckpt["plane_splats"])
         runner.eval(step=ckpt["step"])
         runner.render_traj(step=ckpt["step"])
     else:
